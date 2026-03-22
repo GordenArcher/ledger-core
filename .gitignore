@@ -1,0 +1,18 @@
+# Environment variables — never commit secrets
+.env
+
+# Go build output
+/bin/
+*.exe
+*.out
+
+# Dependency cache
+vendor/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
