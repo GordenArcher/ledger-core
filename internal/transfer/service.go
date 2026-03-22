@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/GordenArcher/ledger-core/internal/account"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -69,6 +70,12 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 
 	if input.Amount <= 0 {
 		return nil, ErrInvalidAmount
+	}
+
+	// If no idempotency key was provided, generate one.
+	// This ensures every transfer has a unique key and the DB constraint is never violated.
+	if input.IdempotencyKey == "" {
+		input.IdempotencyKey = uuid.New().String()
 	}
 
 	// Idempotency check, if this key was already used, return the existing transfer
