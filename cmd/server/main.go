@@ -8,6 +8,7 @@ import (
 	"github.com/GordenArcher/ledger-core/internal/account"
 	"github.com/GordenArcher/ledger-core/internal/idempotency"
 	"github.com/GordenArcher/ledger-core/internal/ledger"
+	"github.com/GordenArcher/ledger-core/internal/reconciliation"
 	"github.com/GordenArcher/ledger-core/internal/transfer"
 	"github.com/GordenArcher/ledger-core/pkg/database"
 	"github.com/GordenArcher/ledger-core/pkg/middleware"
@@ -18,7 +19,7 @@ func main() {
 	cfg := config.Load()
 	db := database.Connect(cfg.DatabaseURL)
 
-	// Auto-migrate all models including the new idempotency records table
+	// Auto-migrate all models
 	if err := db.AutoMigrate(
 		&account.Account{},
 		&transfer.Transfer{},
@@ -35,7 +36,7 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok", "service": "ledger-core"})
 	})
 
-	// Build dependency graph
+	// Build dependency graph bottom-up
 	ledgerRepo := ledger.NewRepository(db)
 	ledgerService := ledger.NewService(ledgerRepo)
 
@@ -47,11 +48,13 @@ func main() {
 
 	idempotencyRepo := idempotency.NewRepository(db)
 
+	// Reconciliation only needs the db, it runs raw aggregate queries
+	reconciliationService := reconciliation.NewService(db)
+
 	// API v1 group
 	v1 := router.Group("/api/v1")
 
-	// Apply idempotency middleware only to POST routes.
-	// GET routes are read-only and don't need deduplication.
+	// Idempotency middleware applied to POST routes only
 	v1.Use(func(c *gin.Context) {
 		if c.Request.Method == "POST" {
 			middleware.Idempotency(idempotencyRepo)(c)
@@ -60,9 +63,11 @@ func main() {
 		}
 	})
 
+	// Register all domain routes
 	account.RegisterRoutes(v1, accountService)
 	transfer.RegisterRoutes(v1, transferService)
 	ledger.RegisterRoutes(v1, ledgerService)
+	reconciliation.RegisterRoutes(v1, reconciliationService)
 
 	addr := fmt.Sprintf(":%s", cfg.ServerPort)
 	log.Printf("ledger-core starting on %s", addr)
