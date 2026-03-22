@@ -7,7 +7,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// Service errors, returned by the service layer and handled in the handler.
+// Service errors — returned by the service layer and handled in the handler.
 // Using typed errors lets the handler make decisions based on error type
 // rather than string matching.
 var (
@@ -19,15 +19,25 @@ var (
 	ErrAccountNotActive    = errors.New("account is not active")
 )
 
+// LedgerRecorder is an interface the account service uses to write ledger entries.
+// Defined here as an interface (not a concrete type) to avoid an import cycle —
+// the ledger package would otherwise import account and account would import ledger.
+type LedgerRecorder interface {
+	RecordDeposit(tx *gorm.DB, accountID string, amount, balanceAfter int64) error
+	RecordWithdrawal(tx *gorm.DB, accountID string, amount, balanceAfter int64) error
+}
+
 // Service contains the business logic for account operations.
 // It sits between the HTTP handler and the repository.
 type Service struct {
-	repo *Repository
+	repo   *Repository
+	ledger LedgerRecorder
 }
 
 // NewService creates a new account Service with the given repository.
-func NewService(repo *Repository) *Service {
-	return &Service{repo: repo}
+// ledger is optional, pass nil to skip ledger writes (useful in tests).
+func NewService(repo *Repository, ledger LedgerRecorder) *Service {
+	return &Service{repo: repo, ledger: ledger}
 }
 
 // CreateAccountInput is the validated input for creating a new account.
@@ -44,7 +54,7 @@ func (s *Service) CreateAccount(input CreateAccountInput) (*Account, error) {
 	// from "User@example.com" and "user@example.com"
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
-	// Validate currency — only allow known values
+	// Validate currency, only allow known values
 	if !isValidCurrency(input.Currency) {
 		return nil, ErrInvalidCurrency
 	}
@@ -94,11 +104,8 @@ type DepositInput struct {
 	Amount int64
 }
 
-// Deposit credits the given amount to the account's balance.
-//
-// Uses SELECT FOR UPDATE inside a transaction to prevent race conditions
-// when multiple deposits hit the same account concurrently.
-// This is the same pattern used in the ECG Credit Union system.
+// Deposit credits the given amount to the account's balance and writes
+// a CREDIT ledger entry, all within a single transaction.
 func (s *Service) Deposit(input DepositInput) (*Account, error) {
 	if input.Amount <= 0 {
 		return nil, ErrInvalidAmount
@@ -106,11 +113,8 @@ func (s *Service) Deposit(input DepositInput) (*Account, error) {
 
 	var updated *Account
 
-	// Wrap the read-modify-write in a transaction so no other operation
-	// can modify the balance between our SELECT and UPDATE
 	err := s.repo.db.Transaction(func(tx *gorm.DB) error {
-		// Lock the row — blocks any concurrent deposit/withdraw/transfer
-		// on this account until this transaction commits or rolls back
+		// Lock the row to prevent concurrent modifications
 		acc, err := s.repo.FindByIDForUpdate(tx, input.AccountID)
 		if err != nil {
 			if IsNotFound(err) {
@@ -119,7 +123,6 @@ func (s *Service) Deposit(input DepositInput) (*Account, error) {
 			return err
 		}
 
-		// Reject operations on non-active accounts
 		if acc.Status != AccountStatusActive {
 			return ErrAccountNotActive
 		}
@@ -129,6 +132,14 @@ func (s *Service) Deposit(input DepositInput) (*Account, error) {
 
 		if err := s.repo.UpdateBalance(tx, acc); err != nil {
 			return err
+		}
+
+		// Write the ledger entry inside the same transaction.
+		// If this fails the balance update also rolls back, atomicity guaranteed.
+		if s.ledger != nil {
+			if err := s.ledger.RecordDeposit(tx, acc.ID, input.Amount, acc.Balance); err != nil {
+				return err
+			}
 		}
 
 		updated = acc
@@ -149,12 +160,8 @@ type WithdrawInput struct {
 	Amount int64
 }
 
-// Withdraw debits the given amount from the account's balance.
-//
-// Returns ErrInsufficientBalance if the account does not have enough funds.
-// Uses SELECT FOR UPDATE inside a transaction to prevent race conditions
-// where two concurrent withdrawals could both pass the balance check
-// and together overdraft the account.
+// Withdraw debits the given amount from the account's balance and writes
+// a DEBIT ledger entry, all within a single transaction.
 func (s *Service) Withdraw(input WithdrawInput) (*Account, error) {
 	if input.Amount <= 0 {
 		return nil, ErrInvalidAmount
@@ -176,8 +183,7 @@ func (s *Service) Withdraw(input WithdrawInput) (*Account, error) {
 			return ErrAccountNotActive
 		}
 
-		// Reject the withdrawal if balance would go negative.
-		// Financial systems never allow negative balances without explicit overdraft facilities.
+		// Reject overdrafts
 		if acc.Balance < input.Amount {
 			return ErrInsufficientBalance
 		}
@@ -187,6 +193,13 @@ func (s *Service) Withdraw(input WithdrawInput) (*Account, error) {
 
 		if err := s.repo.UpdateBalance(tx, acc); err != nil {
 			return err
+		}
+
+		// Write the ledger entry inside the same transaction
+		if s.ledger != nil {
+			if err := s.ledger.RecordWithdrawal(tx, acc.ID, input.Amount, acc.Balance); err != nil {
+				return err
+			}
 		}
 
 		updated = acc

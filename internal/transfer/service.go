@@ -19,22 +19,35 @@ var (
 	ErrDuplicateTransfer   = errors.New("a transfer with this idempotency key already exists")
 )
 
+// LedgerRecorder is the interface the transfer service uses to write ledger entries.
+// Same interface pattern as in the account service — avoids import cycles.
+type LedgerRecorder interface {
+	RecordTransfer(
+		tx *gorm.DB,
+		transferID string,
+		fromAccountID string,
+		toAccountID string,
+		amount int64,
+		senderBalanceAfter int64,
+		receiverBalanceAfter int64,
+		reference string,
+	) error
+}
+
 // Service handles the business logic for transfers.
-// It depends on the account repository directly because a transfer
-// must atomically modify two accounts, we need access to their rows.
 type Service struct {
 	repo        *Repository
 	accountRepo *account.Repository
+	ledger      LedgerRecorder
 	db          *gorm.DB
 }
 
 // NewService creates a new transfer Service.
-// db is passed in directly so the service can open transactions that
-// span both the accounts table and the transfers table.
-func NewService(db *gorm.DB, repo *Repository, accountRepo *account.Repository) *Service {
+func NewService(db *gorm.DB, repo *Repository, accountRepo *account.Repository, ledger LedgerRecorder) *Service {
 	return &Service{
 		repo:        repo,
 		accountRepo: accountRepo,
+		ledger:      ledger,
 		db:          db,
 	}
 }
@@ -43,27 +56,22 @@ func NewService(db *gorm.DB, repo *Repository, accountRepo *account.Repository) 
 type TransferInput struct {
 	FromAccountID  string
 	ToAccountID    string
-	Amount         int64  // in minor units (pesewas/cents)
-	Reference      string // optional description
-	IdempotencyKey string // optional — enforced in Phase 6 middleware
+	Amount         int64
+	Reference      string
+	IdempotencyKey string
 }
 
 // Execute performs a double-entry transfer between two accounts.
 //
-// Double-entry bookkeeping means every transfer produces two effects:
-//   - A DEBIT on the sender   (balance decreases)
-//   - A CREDIT on the receiver (balance increases)
+// Steps inside a single transaction:
+//  1. Lock both accounts in a consistent order (deadlock prevention)
+//  2. Validate status and balance
+//  3. Debit sender, credit receiver
+//  4. Write two ledger entries (one debit, one credit)
+//  5. Persist the transfer record
 //
-// Both effects happen inside a single database transaction.
-// If anything fails, insufficient funds, DB error, account frozen —
-// the entire transaction rolls back and neither balance changes.
-//
-// Locking order: we always lock the account with the lexicographically
-// smaller ID first. This prevents deadlocks when two concurrent transfers
-// involve the same pair of accounts in opposite directions.
-// e.g. A→B and B→A both try to lock A first, so one waits for the other.
+// If any step fails, the entire transaction rolls back.
 func (s *Service) Execute(input TransferInput) (*Transfer, error) {
-	// Basic validations before touching the DB
 	if input.FromAccountID == input.ToAccountID {
 		return nil, ErrSameAccount
 	}
@@ -72,13 +80,12 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 		return nil, ErrInvalidAmount
 	}
 
-	// If no idempotency key was provided, generate one.
-	// This ensures every transfer has a unique key and the DB constraint is never violated.
+	// Generate idempotency key if client didn't provide one
 	if input.IdempotencyKey == "" {
 		input.IdempotencyKey = uuid.New().String()
 	}
 
-	// Idempotency check, if this key was already used, return the existing transfer
+	// If client provided a key, check if this transfer was already processed
 	if input.IdempotencyKey != "" {
 		existing, err := s.repo.FindByIdempotencyKey(input.IdempotencyKey)
 		if err == nil {
@@ -95,10 +102,9 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		// Determine locking order to prevent deadlocks.
-		// Always acquire locks in a consistent order (smaller UUID first).
+		// Always lock the smaller UUID first, consistent across all callers.
 		firstID, secondID := lockOrder(input.FromAccountID, input.ToAccountID)
 
-		// Lock both accounts, no other transfer can touch them until we commit
 		first, err := s.accountRepo.FindByIDForUpdate(tx, firstID)
 		if err != nil {
 			if account.IsNotFound(err) {
@@ -123,7 +129,6 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 			sender, receiver = second, first
 		}
 
-		// Both accounts must be active
 		if sender.Status != account.AccountStatusActive {
 			return errors.New("sender account is not active")
 		}
@@ -131,31 +136,26 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 			return errors.New("receiver account is not active")
 		}
 
-		// Both accounts must share the same currency.
-		// Cross-currency transfers would require an FX rate — out of scope here.
 		if sender.Currency != receiver.Currency {
 			return ErrCurrencyMismatch
 		}
 
-		// Sender must have enough funds
 		if sender.Balance < input.Amount {
 			return ErrInsufficientBalance
 		}
 
-		// Apply the double-entry:
-		// DEBIT sender (balance goes down)
+		// Apply double-entry balance changes
 		sender.Balance -= input.Amount
 		if err := s.accountRepo.UpdateBalance(tx, sender); err != nil {
 			return err
 		}
 
-		// CREDIT receiver (balance goes up)
 		receiver.Balance += input.Amount
 		if err := s.accountRepo.UpdateBalance(tx, receiver); err != nil {
 			return err
 		}
 
-		// Record the transfer
+		// Persist the transfer record
 		transfer := &Transfer{
 			FromAccountID:  input.FromAccountID,
 			ToAccountID:    input.ToAccountID,
@@ -168,6 +168,22 @@ func (s *Service) Execute(input TransferInput) (*Transfer, error) {
 
 		if err := s.repo.Create(tx, transfer); err != nil {
 			return err
+		}
+
+		// Write ledger entries for both sides of the transfer
+		if s.ledger != nil {
+			if err := s.ledger.RecordTransfer(
+				tx,
+				transfer.ID,
+				input.FromAccountID,
+				input.ToAccountID,
+				input.Amount,
+				sender.Balance,
+				receiver.Balance,
+				input.Reference,
+			); err != nil {
+				return err
+			}
 		}
 
 		completed = transfer
@@ -199,8 +215,6 @@ func (s *Service) GetTransfersByAccount(accountID string) ([]Transfer, error) {
 }
 
 // lockOrder returns two account IDs in a consistent order (smaller UUID first).
-// This ensures concurrent transfers between the same pair always lock in the
-// same order, preventing deadlocks.
 func lockOrder(a, b string) (string, string) {
 	if a < b {
 		return a, b
