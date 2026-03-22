@@ -6,24 +6,24 @@ import (
 
 	"github.com/GordenArcher/ledger-core/config"
 	"github.com/GordenArcher/ledger-core/internal/account"
+	"github.com/GordenArcher/ledger-core/internal/idempotency"
 	"github.com/GordenArcher/ledger-core/internal/ledger"
 	"github.com/GordenArcher/ledger-core/internal/transfer"
 	"github.com/GordenArcher/ledger-core/pkg/database"
+	"github.com/GordenArcher/ledger-core/pkg/middleware"
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// Load all configuration from environment / .env file
 	cfg := config.Load()
-
-	// Connect to PostgreSQL
 	db := database.Connect(cfg.DatabaseURL)
 
-	// Auto-migrate all models
+	// Auto-migrate all models including the new idempotency records table
 	if err := db.AutoMigrate(
 		&account.Account{},
 		&transfer.Transfer{},
 		&ledger.Entry{},
+		&idempotency.Record{},
 	); err != nil {
 		log.Fatalf("Auto-migration failed: %v", err)
 	}
@@ -35,24 +35,33 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok", "service": "ledger-core"})
 	})
 
-	v1 := router.Group("/api/v1")
-
-	// Build dependency graph bottom-up:
-	// ledger has no dependencies on other domains
+	// Build dependency graph
 	ledgerRepo := ledger.NewRepository(db)
 	ledgerService := ledger.NewService(ledgerRepo)
 
-	// account depends on ledger for writing entries
 	accountRepo := account.NewRepository(db)
 	accountService := account.NewService(accountRepo, ledgerService)
-	account.RegisterRoutes(v1, accountService)
 
-	// transfer depends on both account repo and ledger
 	transferRepo := transfer.NewRepository(db)
 	transferService := transfer.NewService(db, transferRepo, accountRepo, ledgerService)
-	transfer.RegisterRoutes(v1, transferService)
 
-	// ledger endpoints (account statement)
+	idempotencyRepo := idempotency.NewRepository(db)
+
+	// API v1 group
+	v1 := router.Group("/api/v1")
+
+	// Apply idempotency middleware only to POST routes.
+	// GET routes are read-only and don't need deduplication.
+	v1.Use(func(c *gin.Context) {
+		if c.Request.Method == "POST" {
+			middleware.Idempotency(idempotencyRepo)(c)
+		} else {
+			c.Next()
+		}
+	})
+
+	account.RegisterRoutes(v1, accountService)
+	transfer.RegisterRoutes(v1, transferService)
 	ledger.RegisterRoutes(v1, ledgerService)
 
 	addr := fmt.Sprintf(":%s", cfg.ServerPort)
